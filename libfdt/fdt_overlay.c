@@ -12,8 +12,6 @@
 
 #include "libfdt_internal.h"
 
-#undef DEBUG
-
 #ifdef DEBUG
 #define dprintf(x...)   printf(x)
 #else
@@ -22,6 +20,8 @@
 
 #define MAX_BUF_SIZE	256
 #define MAX_ULONG	((unsigned long)~0UL)
+
+static bool find_node_str(const char *path_str, const char *node);
 
 /**
  * overlay_get_target_phandle - retrieves the target phandle of a fragment
@@ -506,7 +506,8 @@ static int overlay_fixup_phandle(void *fdt, void *fdto, int symbols_off,
  *                          device tree
  * @fdt: Base Device Tree blob
  * @fdto: Device tree overlay blob
- * @merge: Both input blobs are overlay blobs that are being merged
+ * @merge_olay_max_phdl: Pointer to max phandle value for merged blobs,
+ *     Both input blobs are overlay blobs that are being merged
  *
  * overlay_fixup_phandles() resolves all the overlay phandles pointing
  * to nodes in the base device tree.
@@ -519,7 +520,8 @@ static int overlay_fixup_phandle(void *fdt, void *fdto, int symbols_off,
  *      0 on success
  *      Negative error code on failure
  */
-static int overlay_fixup_phandles(void *fdt, void *fdto, int merge)
+static int overlay_fixup_phandles(void *fdt, void *fdto,
+				  uint32_t merge_olay_max_phdl)
 {
 	int fixups_off, symbols_off;
 	int property, ret = 0;
@@ -539,7 +541,7 @@ static int overlay_fixup_phandles(void *fdt, void *fdto, int merge)
 	fdt_for_each_property_offset(property, fdto, fixups_off) {
 		ret = overlay_fixup_phandle(fdt, fdto, symbols_off,
 					    property, fixups_off);
-		if (ret && (!merge || ret != -FDT_ERR_NOTFOUND))
+		if (ret && (!merge_olay_max_phdl || ret != -FDT_ERR_NOTFOUND))
 			return ret;
 	}
 
@@ -650,16 +652,13 @@ static int copy_node(void *fdt, void *fdto, int fdt_parent,
 	}
 
 	fdt_for_each_property_offset(prop, fdto, fdto_child) {
-		int ret, fdt_len = 0;
+		int ret;
 		const char *value, *pname;
 		void *p;
 
 		value = fdt_getprop_by_offset(fdto, prop, &pname, &len);
 		if (!value)
 			return len;
-
-		if (fdt_getprop(fdt, parent, pname, &fdt_len))
-			len += fdt_len;
 
 		ret = fdt_setprop_placeholder(fdt, parent, pname, len, &p);
 		if (ret)
@@ -751,12 +750,15 @@ static int add_phandle(void *fdt, char *node_name, uint32_t phandle)
 }
 
 static int copy_fragment_to_base(void *fdt, void *fdto,
-				 int fragment, uint32_t *max_phandle,
+				 int fragment, uint32_t *merge_olay_max_phdl,
 				 unsigned long *base_fragment_count)
 {
 	char name[MAX_BUF_SIZE];
 	int ret;
-	uint32_t target_phandle = *max_phandle;
+	uint32_t target_phandle = *merge_olay_max_phdl;
+
+	if (merge_olay_max_phdl == NULL)
+		return -FDT_ERR_BADPHANDLE;
 
 	ret = get_fragment_name(fdto, fragment, name, sizeof(name));
 	if (ret)
@@ -779,7 +781,7 @@ static int copy_fragment_to_base(void *fdt, void *fdto,
 	if (ret)
 		return ret;
 
-	return (++(*max_phandle) == UINT32_MAX ||
+	return (++(*merge_olay_max_phdl) == UINT32_MAX ||
 		++(*base_fragment_count) == ULONG_MAX) ?
 	    -FDT_ERR_BADOVERLAY : 0;
 }
@@ -802,13 +804,12 @@ static int count_fragments(void *fdt, unsigned long *max_base_fragments);
  *      0 on success
  *      Negative error code on failure
  */
-static int overlay_merge(void *fdt, void *fdto, int merge,
-			 uint32_t *max_phandle)
+static int overlay_merge(void *fdt, void *fdto, uint32_t *merge_olay_max_phdl)
 {
 	int fragment, ret;
 	unsigned long base_fragment_count = 0;
 
-	if (merge) {
+	if (merge_olay_max_phdl) {
 		ret = count_fragments(fdt, &base_fragment_count);
 		/* no fragments in base dtb? then nothing to rename */
 		if (ret && ret != -FDT_ERR_NOTFOUND)
@@ -834,7 +835,8 @@ static int overlay_merge(void *fdt, void *fdto, int merge,
 
 		target = overlay_get_target(fdt, fdto, fragment, NULL);
 		if (target < 0) {
-			if (!merge || target != -FDT_ERR_BADPHANDLE)
+			if (!merge_olay_max_phdl
+			    || target != -FDT_ERR_BADPHANDLE)
 				return target;
 
 			/*
@@ -845,7 +847,7 @@ static int overlay_merge(void *fdt, void *fdto, int merge,
 			 * combined blob on another base blob.
 			 */
 			ret = copy_fragment_to_base(fdt, fdto, fragment,
-						    max_phandle,
+						    merge_olay_max_phdl,
 						    &base_fragment_count);
 			if (ret)
 				return ret;
@@ -893,6 +895,8 @@ static int get_path_len(const void *fdt, int nodeoffset)
  * overlay_symbol_update - Update the symbols of base tree after a merge
  * @fdt: Base Device Tree blob
  * @fdto: Device tree overlay blob
+ * @merge_olay_max_phdl: Pointer to max phandle value for merged blobs,
+ *         Both input blobs are overlay blobs that are being merged
  *
  * overlay_symbol_update() updates the symbols of the base tree with the
  * symbols of the applied overlay
@@ -905,15 +909,16 @@ static int get_path_len(const void *fdt, int nodeoffset)
  *      0 on success
  *      Negative error code on failure
  */
-static int overlay_symbol_update(void *fdt, void *fdto, uint32_t max_phandle)
+static int overlay_symbol_update(void *fdt, void *fdto,
+				 uint32_t merge_olay_max_phdl)
 {
 	int root_sym, ov_sym, prop, next_prop, path_len, fragment, target;
-	int len, frag_name_len, ret, rel_path_len, rel_path_len1 = 0;
+	int len, frag_name_len, ret, rel_path_len, rel_path_len_olay = 0;
 	const char *s, *e;
 	const char *path;
 	const char *name;
 	const char *frag_name;
-	const char *rel_path, *rel_path1 = NULL;
+	const char *rel_path, *rel_path_olay = NULL;
 	const char *target_path;
 	char *buf;
 	void *p;
@@ -974,9 +979,9 @@ static int overlay_symbol_update(void *fdt, void *fdto, uint32_t max_phandle)
 			rel_path = s + len;
 			rel_path_len = e - rel_path - 1;
 
-			if (max_phandle != 0) {
-				rel_path1 = s + 1;
-				rel_path_len1 = e - rel_path1 - 1;
+			if (merge_olay_max_phdl != 0) {
+				rel_path_olay = s + 1;
+				rel_path_len_olay = e - rel_path_olay - 1;
 			}
 		} else if ((e - s) == len
 			   && (memcmp(s, "/__overlay__", len - 1) == 0)) {
@@ -1007,18 +1012,22 @@ static int overlay_symbol_update(void *fdt, void *fdto, uint32_t max_phandle)
 		if (ret < 0)
 			return ret;
 
-		if (rel_path1) {
+		target = ret;
+
+		/* Before proceeding further, check if you need to update
+		 * rel_path for dtbo-dtbo merging case
+		 */
+		if (rel_path_olay) {
 			uint32_t phandle =
 			    overlay_get_target_phandle(fdto, fragment);
-			int base_symbol_found = (phandle < max_phandle);
+			int base_symbol_found = (phandle < merge_olay_max_phdl);
 
+			/* For new nodes we need the overlay string in path */
 			if (!base_symbol_found) {
-				rel_path = rel_path1;
-				rel_path_len = rel_path_len1;
+				rel_path = rel_path_olay;
+				rel_path_len = rel_path_len_olay;
 			}
 		}
-
-		target = ret;
 
 		/* if we have a target path use */
 		if (!target_path) {
@@ -1055,8 +1064,9 @@ static int overlay_symbol_update(void *fdt, void *fdto, uint32_t max_phandle)
 			} else
 				memcpy(buf, target_path, len + 1);
 
-		} else
+		} else {
 			len--;
+		}
 
 		buf[len] = '/';
 		memcpy(buf + len + 1, rel_path, rel_path_len);
@@ -1092,7 +1102,7 @@ int fdt_overlay_apply(void *fdt, void *fdto)
 	if (ret)
 		goto err;
 
-	ret = overlay_merge(fdt, fdto, 0, NULL);
+	ret = overlay_merge(fdt, fdto, NULL);
 	if (ret)
 		goto err;
 
@@ -1217,15 +1227,16 @@ static void *get_next_component(const char **p, int *len, char sep)
 
 static int lookup_target_path(void *fdt, void *fdto, const char *fragment,
 			      int frag_name_len, char *buf, int buf_len,
-			      int *target_phandle)
+			      int *target_off, int *root_path)
 {
 	int offset, ret, target, len;
 	const char *target_path;
-	static const char fragstr[] = "fragment";
+	static const char fragstr[] = "fragment@";
 	int fragstrlen = sizeof(fragstr) - 1;
 
 	memset(buf, 0, buf_len);
 
+	/* Check fdto-fragment has fragment string */
 	if (frag_name_len < fragstrlen || memcmp(fragment, fragstr, fragstrlen))
 		return -FDT_ERR_BADOVERLAY;
 
@@ -1248,8 +1259,8 @@ static int lookup_target_path(void *fdt, void *fdto, const char *fragment,
 		return ret;
 
 	target = ret;
-	if (target_phandle)
-		*target_phandle = ret;
+	if (target_off)
+		*target_off = ret;
 
 	/* if we have a target path use */
 	if (!target_path) {
@@ -1273,13 +1284,19 @@ static int lookup_target_path(void *fdt, void *fdto, const char *fragment,
 
 	}
 
+	/* Check fdt-path is having fragments or it part of root path */
+	if (root_path && find_node_str(buf, fragstr))
+		*root_path = 0;
+	else
+		*root_path = 1;
+
 	return 0;
 }
 
 static int fixup_snippet_update(void *fdt, void *fdto, const char *snippet,
 				int snippet_len, char *buf, int buflen,
 				int *ignore, int base_symbol_found,
-				uint32_t max_phandle)
+				uint32_t merge_olay_max_phdl)
 {
 	const char *snippet_o = snippet;
 	const char *path, *fragment, *prop_name, *prop_val, *rel_path;
@@ -1289,6 +1306,7 @@ static int fixup_snippet_update(void *fdt, void *fdto, const char *snippet,
 	static const char tprop[] = "target";
 	static const char frag[] = "/fragment";
 	static const char olay[] = "/__overlay__";
+	int root_path = 0;
 
 	/* Validate format:
 	 *      path_to_node : prop_name : prop_offset
@@ -1308,9 +1326,8 @@ static int fixup_snippet_update(void *fdt, void *fdto, const char *snippet,
 	if (path_len < sizeof(frag) - 1 || memcmp(path, frag, sizeof(frag) - 1))
 		return -FDT_ERR_BADOVERLAY;
 
-	if (base_symbol_found &&
-	    prop_len == sizeof(tprop) - 1 &&
-	    !memcmp(prop_name, tprop, sizeof(tprop) - 1)) {
+	if (base_symbol_found && prop_len == sizeof(tprop) - 1
+	    && !memcmp(prop_name, tprop, sizeof(tprop) - 1)) {
 		*ignore = 1;
 		return 0;
 	}
@@ -1319,8 +1336,6 @@ static int fixup_snippet_update(void *fdt, void *fdto, const char *snippet,
 	// check if there is a '/' besides the first one in node_path
 	sep = memchr(fragment + 1, '/', path_len - 1);
 	if (sep) {
-		int fragment_target_found = 0;
-
 		fragment_len = sep - fragment;
 		path_len -= (sep - fragment);
 		if (path_len < sizeof(olay) - 1
@@ -1342,19 +1357,8 @@ static int fixup_snippet_update(void *fdt, void *fdto, const char *snippet,
 					       "__overlay__");
 			if (ret < 0)
 				return -FDT_ERR_BADOVERLAY;
-
-			/* get the target of the fragment */
-			ret = overlay_get_target(fdt, fdto, frag_offset, NULL);
-			if (ret < 0)
-				return ret;
-
-			fragment_target_found = (ret < max_phandle);
 		}
-
-		if (fragment_target_found)
-			rel_path = sep + sizeof(olay) - 1;
-		else
-			rel_path = sep;
+		rel_path = sep;
 	} else {
 		rel_path = fragment + path_len;
 		fragment_len = path_len;
@@ -1366,9 +1370,16 @@ static int fixup_snippet_update(void *fdt, void *fdto, const char *snippet,
 
 	ret =
 	    lookup_target_path(fdt, fdto, fragment + 1, fragment_len - 1, buf,
-			       buflen, NULL);
+			       buflen, NULL, &root_path);
 	if (ret)
 		return ret;
+
+	/* Only single overlay should be present in path */
+	if (find_node_str(buf, "__overlay__")
+	    && find_node_str(rel_path, "__overlay__")) {
+		if (sep)
+			rel_path = sep + sizeof(olay) - 1;
+	}
 
 	rem = buflen - strlen(buf);
 	if (rel_path_len >= rem)
@@ -1472,6 +1483,25 @@ static const char *next_node(const char **path, int *path_len, int *node_len)
 	return node;
 }
 
+static bool find_node_str(const char *path_str, const char *ip_str)
+{
+	const char *path, *node_str;
+	int path_len = 0, node_len = 0, ip_str_len = 0;
+
+	path = path_str;
+	path_len = strlen(path);
+	ip_str_len = strlen(ip_str);
+
+	while ((node_str = next_node(&path, &path_len, &node_len))) {
+		if (node_len >= ip_str_len
+		    && !memcmp(node_str, ip_str, ip_str_len)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static int convert_to_u32(const char *p, uint32_t *val)
 {
 	char *endptr;
@@ -1525,10 +1555,11 @@ static int add_to_local_fixups(void *fdt, const char *snippet)
 
 		offset =
 		    fdt_subnode_offset_namelen(fdt, parent, node, node_len);
-		if (offset < 0)
+		if (offset < 0) {
 			offset =
 			    fdt_add_subnode_namelen(fdt, parent, node,
 						    node_len);
+		}
 		if (offset < 0)
 			return offset;
 		parent = offset;
@@ -1547,7 +1578,8 @@ static int add_to_local_fixups(void *fdt, const char *snippet)
 	return fdt_appendprop_u32(fdt, parent, buf, val);
 }
 
-static int overlay_fixups_update(void *fdt, void *fdto, uint32_t max_phandle)
+static int overlay_fixups_update(void *fdt, void *fdto,
+				 uint32_t merge_olay_max_phdl)
 {
 	int ov_fixup, root_fixup, prop;
 
@@ -1569,9 +1601,6 @@ static int overlay_fixups_update(void *fdt, void *fdto, uint32_t max_phandle)
 
 		base_symbol_found =
 		    prop_exists_in_node(fdt, "/__symbols__", label);
-		dprintf
-		    ("%s: Checking prop label %s val %s base_symbol_found %d\n",
-		     __func__, label, prop_val, base_symbol_found);
 
 		while ((snippet =
 			next_snippet(&prop_val, &prop_len, &snippet_len))) {
@@ -1583,10 +1612,7 @@ static int overlay_fixups_update(void *fdt, void *fdto, uint32_t max_phandle)
 						 snippet_len, new_val,
 						 sizeof(new_val), &ignore,
 						 base_symbol_found,
-						 max_phandle);
-			dprintf
-			    ("%s: fixup_snippet %s new_val %s ret %d ignore %d\n",
-			     __func__, snippet, new_val, ret, ignore);
+						 merge_olay_max_phdl);
 			if (ret)
 				return ret;
 
@@ -1597,7 +1623,6 @@ static int overlay_fixups_update(void *fdt, void *fdto, uint32_t max_phandle)
 				ret = add_to_fixups(fdt, new_val, label);
 			else
 				ret = add_to_local_fixups(fdt, new_val);
-
 			if (ret)
 				return ret;
 		}
@@ -1607,9 +1632,10 @@ static int overlay_fixups_update(void *fdt, void *fdto, uint32_t max_phandle)
 }
 
 static int overlay_local_fixups_update(void *fdt, void *fdto,
-				       uint32_t max_phandle)
+				       uint32_t merge_olay_max_phdl)
 {
 	int ov_lfixups, root_lfixups, node, ret;
+	int root_path = 0;
 
 	ov_lfixups = fdt_subnode_offset(fdto, 0, "__local_fixups__");
 	if (ov_lfixups == -FDT_ERR_NOTFOUND)
@@ -1623,18 +1649,22 @@ static int overlay_local_fixups_update(void *fdt, void *fdto,
 		return root_lfixups;
 
 	fdt_for_each_subnode(node, fdto, ov_lfixups) {
-		int len, child_node, target_phandle, parent_node;
+		int len, child_node, parent_node;
 		int skip_fdto_child = 0;
-		int base_symbol_found;
 		const char *name = fdt_get_name(fdto, node, &len);
 		char buf[MAX_BUF_SIZE];
 
 		ret = lookup_target_path(fdt, fdto, name, strlen(name),
-					 buf, sizeof(buf), &target_phandle);
+					 buf, sizeof(buf), NULL, &root_path);
 		if (ret)
 			return ret;
 
-		base_symbol_found = !(target_phandle >= max_phandle);
+		/* We want to skip dtbo overlay child in two cases
+		 * i.e When target path doesn't have fragment@ or __overlay__
+		 * strings
+		 */
+		if (root_path || find_node_str(buf, "__overlay__"))
+			skip_fdto_child = 1;
 
 		parent_node = add_to_local_fixups(fdt, buf);
 		if (parent_node < 0)
@@ -1643,9 +1673,6 @@ static int overlay_local_fixups_update(void *fdt, void *fdto,
 		child_node = fdt_subnode_offset(fdto, node, "__overlay__");
 		if (child_node < 0)
 			return -FDT_ERR_BADOVERLAY;
-
-		if (base_symbol_found)
-			skip_fdto_child = 1;
 
 		ret = copy_node(fdt, fdto, parent_node, child_node,
 				NULL, skip_fdto_child);
@@ -1671,10 +1698,8 @@ int fdt_overlay_merge(void *fdt, void *fdto, int *fdto_nospace)
 	if (UINT32_MAX - delta < delta0)
 		return -FDT_ERR_BADOVERLAY;
 	max_phandle = delta + delta0 + 1;
-	dprintf("delta %u max_phandle %u\n", delta, max_phandle);
 
 	ret = overlay_adjust_local_phandles(fdto, delta);
-	dprintf("adjust_local_phandles %d\n", ret);
 	if (ret) {
 		if (ret == -FDT_ERR_NOSPACE)
 			*fdto_nospace = 1;
@@ -1682,38 +1707,32 @@ int fdt_overlay_merge(void *fdt, void *fdto, int *fdto_nospace)
 	}
 
 	ret = overlay_update_local_references(fdto, delta);
-	dprintf("update_local_references %d\n", ret);
 	if (ret) {
 		if (ret == -FDT_ERR_NOSPACE)
 			*fdto_nospace = 1;
 		goto err;
 	}
 
-	ret = overlay_fixup_phandles(fdt, fdto, 1);
-	dprintf("fixup_phandles %d\n", ret);
+	ret = overlay_fixup_phandles(fdt, fdto, max_phandle);
 	if (ret && ret != -FDT_ERR_NOTFOUND)
 		goto err;
 
-	ret = overlay_merge(fdt, fdto, 1, &max_phandle);
-	dprintf("overlay_merge %d\n", ret);
+	ret = overlay_merge(fdt, fdto, &max_phandle);
 	if (ret)
 		goto err;
 
 	/* local_fixups node is optional */
 	max_phandle = delta + delta0 + 1;
 	ret = overlay_symbol_update(fdt, fdto, max_phandle);
-	dprintf("overlay_symbol_update %d\n", ret);
 	if (ret)
 		goto err;
 
 	/* fixups node is optional */
 	ret = overlay_fixups_update(fdt, fdto, max_phandle);
-	dprintf("overlay_fixups_update %d\n", ret);
 	if (ret < 0 && ret != -FDT_ERR_NOTFOUND)
 		goto err;
 
 	ret = overlay_local_fixups_update(fdt, fdto, max_phandle);
-	dprintf("overlay_local_fixups_update %d\n", ret);
 	if (ret < 0 && ret != -FDT_ERR_NOTFOUND)
 		goto err;
 
@@ -1722,7 +1741,6 @@ int fdt_overlay_merge(void *fdt, void *fdto, int *fdto_nospace)
 	 */
 	fdt_set_magic(fdto, ~0);
 
-	dprintf("overlay_merge completed successfully!\n");
 	return 0;
 
 err:
