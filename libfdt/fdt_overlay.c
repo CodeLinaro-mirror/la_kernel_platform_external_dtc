@@ -763,10 +763,12 @@ static int copy_fragment_to_base(void *fdt, void *fdto,
 {
 	char name[MAX_BUF_SIZE];
 	int ret;
-	uint32_t target_phandle = *merge_olay_max_phdl;
+	uint32_t target_phandle;
 
 	if (merge_olay_max_phdl == NULL)
 		return -FDT_ERR_BADPHANDLE;
+
+	target_phandle = *merge_olay_max_phdl;
 
 	ret = get_fragment_name(fdto, fragment, name, sizeof(name));
 	if (ret)
@@ -1242,10 +1244,12 @@ static int lookup_target_path(void *fdt, void *fdto, const char *fragment,
 	static const char fragstr[] = "fragment@";
 	int fragstrlen = sizeof(fragstr) - 1;
 
-	memset(buf, 0, buf_len);
+	if (!root_path)
+		return -FDT_ERR_BADOVERLAY;
 
 	/* Check fdto-fragment has fragment string */
-	if (frag_name_len < fragstrlen || memcmp(fragment, fragstr, fragstrlen))
+	if (!fragment || frag_name_len < fragstrlen
+			|| memcmp(fragment, fragstr, fragstrlen))
 		return -FDT_ERR_BADOVERLAY;
 
 	/* find the fragment index in which the symbol lies */
@@ -1282,6 +1286,8 @@ static int lookup_target_path(void *fdt, void *fdto, const char *fragment,
 	if (len >= buf_len)
 		return -FDT_ERR_INTERNAL;
 
+	memset(buf, 0, buf_len);
+
 	if (len > 1) {		/* target is not root */
 		if (!target_path) {
 			ret = fdt_get_path(fdt, target, buf, len + 1);
@@ -1293,7 +1299,7 @@ static int lookup_target_path(void *fdt, void *fdto, const char *fragment,
 	}
 
 	/* Check fdt-path is having fragments or it part of root path */
-	if (root_path && find_node_str(buf, fragstr))
+	if (find_node_str(buf, fragstr))
 		*root_path = 0;
 	else
 		*root_path = 1;
