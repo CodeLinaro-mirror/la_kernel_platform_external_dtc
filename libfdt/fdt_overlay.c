@@ -1668,6 +1668,9 @@ static int overlay_local_fixups_update(void *fdt, void *fdto,
 		const char *name = fdt_get_name(fdto, node, &len);
 		char buf[MAX_BUF_SIZE];
 
+		if (!name)
+			return -FDT_ERR_BADSTRUCTURE;
+
 		ret = lookup_target_path(fdt, fdto, name, strlen(name),
 					 buf, sizeof(buf), NULL, &root_path);
 		if (ret)
